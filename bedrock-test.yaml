@@ -1,0 +1,213 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Bedrock VPC endpoint test — everything in one file.
+#
+#   1. Edit the 3 values marked "EDIT" below.
+#   2. kubectl apply -f bedrock-test.yaml
+#   3. kubectl logs -f bedrock-endpoint-test -n bedrock-test
+#
+# To run it again:
+#   kubectl delete pod bedrock-endpoint-test -n bedrock-test
+#   kubectl apply -f bedrock-test.yaml
+#
+# The pod checks, in order: private DNS resolution -> TCP 443 -> IRSA credentials
+# -> Bedrock control plane -> a real model call. It separates network failures
+# from permission failures: an AccessDenied still proves the endpoint works.
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: bedrock-test
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: bedrock-test-sa
+  namespace: bedrock-test
+  annotations:
+    # EDIT 1 — IAM role for IRSA. Needs bedrock:InvokeModel, bedrock:Converse,
+    # bedrock:ListFoundationModels, and a trust policy for this namespace/SA.
+    # Delete this whole annotation to run the network-only checks (1 and 2).
+    eks.amazonaws.com/role-arn: arn:aws:iam::000000000000:role/eks-bedrock-endpoint-test
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: bedrock-endpoint-test
+  namespace: bedrock-test
+  labels:
+    app: bedrock-endpoint-test
+spec:
+  serviceAccountName: bedrock-test-sa
+  restartPolicy: Never
+  containers:
+    - name: test
+      # Any image with bash + aws cli works. If your nodes cannot reach ECR Public,
+      # point this at an image they already have.
+      image: public.ecr.aws/aws-cli/aws-cli:latest
+      command: ["/bin/bash", "/scripts/test.sh"]
+      env:
+        # EDIT 2 — your region (both values must match)
+        - name: AWS_REGION
+          value: "ap-southeast-1"
+        - name: AWS_DEFAULT_REGION
+          value: "ap-southeast-1"
+        # EDIT 3 — model to call. List yours with:
+        #   aws bedrock list-inference-profiles --region <region>
+        - name: BEDROCK_MODEL_ID
+          value: "apac.anthropic.claude-sonnet-5"
+        - name: AWS_STS_REGIONAL_ENDPOINTS
+          value: "regional"
+        - name: AWS_MAX_ATTEMPTS
+          value: "2"
+      resources:
+        requests: {cpu: 50m, memory: 128Mi}
+        limits:   {cpu: 500m, memory: 512Mi}
+      volumeMounts:
+        - name: script
+          mountPath: /scripts
+  volumes:
+    - name: script
+      configMap:
+        name: bedrock-test-script
+        defaultMode: 0755
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bedrock-test-script
+  namespace: bedrock-test
+data:
+  test.sh: |
+    #!/usr/bin/env bash
+    REGION_="${AWS_REGION}"
+    MODEL_="${BEDROCK_MODEL_ID}"
+    PASS=0; WARN=0; FAIL=0
+    AWSCLI=(aws --no-cli-pager --cli-connect-timeout 5 --cli-read-timeout 30 --region "$REGION_")
+
+    ok()   { echo "  [PASS] $*"; PASS=$((PASS+1)); }
+    warn() { echo "  [WARN] $*"; WARN=$((WARN+1)); }
+    bad()  { echo "  [FAIL] $*"; FAIL=$((FAIL+1)); }
+    hdr()  { echo; echo "=== $* ==="; }
+
+    classify_ip() {
+      case "$1" in
+        10.*|192.168.*)                          echo private ;;
+        172.1[6-9].*|172.2[0-9].*|172.3[01].*)   echo private ;;
+        127.*)                                   echo loopback ;;
+        *)                                       echo public ;;
+      esac
+    }
+
+    # Any AWS API error means bytes reached the endpoint -> the network path works.
+    # Only connection-level errors mean the VPC endpoint is wrong or unreachable.
+    is_network_error() {
+      case "$1" in
+        *"Could not connect to the endpoint URL"*|*EndpointConnectionError*) return 0 ;;
+        *"Connect timeout"*|*ConnectTimeoutError*|*"Read timeout"*)          return 0 ;;
+        *"Failed to resolve"*|*"Name or service not known"*)                 return 0 ;;
+        *"SSL"*|*"CERTIFICATE_VERIFY_FAILED"*)                               return 0 ;;
+        *) return 1 ;;
+      esac
+    }
+
+    echo "######################################################################"
+    echo "# Bedrock VPC endpoint test   pod=$(hostname)  region=$REGION_"
+    echo "# model=$MODEL_   $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    echo "######################################################################"
+
+    hdr "1. DNS — do the endpoints resolve to PRIVATE addresses?"
+    for HOST in "bedrock-runtime.$REGION_.amazonaws.com" \
+                "bedrock.$REGION_.amazonaws.com" \
+                "sts.$REGION_.amazonaws.com"; do
+      IPS=$(getent hosts "$HOST" 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ' ')
+      if [ -z "$IPS" ]; then
+        bad "$HOST does not resolve at all"
+        continue
+      fi
+      if [ "$(classify_ip "${IPS%% *}")" = private ]; then
+        ok "$HOST -> $IPS (private — resolving to the VPC endpoint ENI)"
+      else
+        warn "$HOST -> $IPS (PUBLIC — traffic leaves via IGW/NAT, not the VPC endpoint.
+           Cause: no interface endpoint in this VPC, 'Enable DNS name' is off on it,
+           or the VPC lacks enableDnsSupport/enableDnsHostnames.)"
+      fi
+    done
+
+    hdr "2. TCP — is 443 reachable on the endpoint ENI?"
+    for HOST in "bedrock-runtime.$REGION_.amazonaws.com" \
+                "bedrock.$REGION_.amazonaws.com" \
+                "sts.$REGION_.amazonaws.com"; do
+      if timeout 6 bash -c "exec 3<>/dev/tcp/$HOST/443" 2>/dev/null; then
+        ok "$HOST:443 open"
+      else
+        bad "$HOST:443 refused/timed out
+           Cause: the endpoint's security group does not allow 443 from the node/pod
+           CIDR, or there is no route to the endpoint subnet."
+      fi
+    done
+
+    hdr "3. IRSA — does this pod have AWS credentials?"
+    if OUT=$("${AWSCLI[@]}" sts get-caller-identity 2>&1); then
+      ok "credentials resolved as: $(echo "$OUT" | tr -d ' \n')"
+    elif is_network_error "$OUT"; then
+      bad "cannot reach STS — add a com.amazonaws.$REGION_.sts endpoint (IRSA needs it)
+           $OUT"
+    else
+      bad "STS reachable but identity failed (trust policy / OIDC provider / annotation)
+           $OUT"
+    fi
+
+    hdr "4. Bedrock control plane — com.amazonaws.$REGION_.bedrock"
+    if OUT=$("${AWSCLI[@]}" bedrock list-foundation-models \
+               --query 'modelSummaries[0:5].modelId' --output text 2>&1); then
+      ok "list-foundation-models answered: $(echo "$OUT" | tr '\t' ' ')"
+    elif is_network_error "$OUT"; then
+      bad "NETWORK: the bedrock control-plane endpoint is not reachable
+           $OUT"
+    else
+      warn "ENDPOINT REACHED, call rejected (network is fine — IAM or endpoint policy)
+           $OUT"
+    fi
+
+    hdr "5. Bedrock runtime — com.amazonaws.$REGION_.bedrock-runtime (the real test)"
+    if OUT=$("${AWSCLI[@]}" bedrock-runtime converse \
+               --model-id "$MODEL_" \
+               --messages '[{"role":"user","content":[{"text":"Reply with the single word: pong"}]}]' \
+               --inference-config '{"maxTokens":16}' \
+               --query 'output.message.content[0].text' --output text 2>&1); then
+      ok "Converse succeeded — model replied: $(echo "$OUT" | tr -d '\n')"
+    elif echo "$OUT" | grep -qi "Invalid choice"; then
+      warn "this aws-cli build has no 'converse'; falling back to invoke-model"
+      if OUT=$("${AWSCLI[@]}" bedrock-runtime invoke-model \
+                 --model-id "$MODEL_" --cli-binary-format raw-in-base64-out \
+                 --body '{"anthropic_version":"bedrock-2023-05-31","max_tokens":16,"messages":[{"role":"user","content":"Reply with the single word: pong"}]}' \
+                 /tmp/out.json 2>&1); then
+        ok "InvokeModel succeeded — $(tr -d '\n' < /tmp/out.json | cut -c1-300)"
+      elif is_network_error "$OUT"; then
+        bad "NETWORK: bedrock-runtime endpoint unreachable
+           $OUT"
+      else
+        warn "ENDPOINT REACHED, call rejected (network fine — IAM / model access / policy)
+           $OUT"
+      fi
+    elif is_network_error "$OUT"; then
+      bad "NETWORK: the bedrock-runtime VPC endpoint is NOT working
+           $OUT"
+    else
+      warn "ENDPOINT REACHED, call rejected — the VPC endpoint path is fine. This is a
+           permissions / model-access / endpoint-policy problem, not networking:
+           $OUT"
+    fi
+
+    hdr "VERDICT"
+    echo "  pass=$PASS  warn=$WARN  fail=$FAIL"
+    if [ "$FAIL" -eq 0 ] && [ "$WARN" -eq 0 ]; then
+      echo "  ✅ VPC endpoint to Bedrock is CORRECT — DNS, connectivity, IAM and inference all work."
+      exit 0
+    elif [ "$FAIL" -eq 0 ]; then
+      echo "  ⚠️  Network path to Bedrock works; see the WARN lines for what still needs attention."
+      exit 0
+    else
+      echo "  ❌ VPC endpoint to Bedrock is NOT correct — see the FAIL lines above."
+      exit 1
+    fi

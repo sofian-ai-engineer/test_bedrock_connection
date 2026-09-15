@@ -1,8 +1,1 @@
-# Rendered manifests and the saved IAM role ARN — generated per-run, machine-specific
-.generated/
-
-# config.env holds your cluster name / account-specific values.
-# Uncomment the next line if you would rather not commit it:
-# config.env
-
 .DS_Store
