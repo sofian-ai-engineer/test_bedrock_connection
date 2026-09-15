@@ -22,7 +22,7 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: bedrock-test-sa
-  namespace: bedrock-test
+  namespace: agentic
   annotations:
     # EDIT 1 — IAM role for IRSA. Needs bedrock:InvokeModel, bedrock:Converse,
     # bedrock:ListFoundationModels, and a trust policy for this namespace/SA.
@@ -33,7 +33,7 @@ apiVersion: v1
 kind: Pod
 metadata:
   name: bedrock-endpoint-test
-  namespace: bedrock-test
+  namespace: agentic
   labels:
     app: bedrock-endpoint-test
 spec:
@@ -45,20 +45,6 @@ spec:
       # point this at an image they already have.
       image: public.ecr.aws/aws-cli/aws-cli:latest
       command: ["/bin/bash", "/scripts/test.sh"]
-      env:
-        # EDIT 2 — your region (both values must match)
-        - name: AWS_REGION
-          value: "ap-southeast-1"
-        - name: AWS_DEFAULT_REGION
-          value: "ap-southeast-1"
-        # EDIT 3 — model to call. List yours with:
-        #   aws bedrock list-inference-profiles --region <region>
-        - name: BEDROCK_MODEL_ID
-          value: "apac.anthropic.claude-sonnet-5"
-        - name: AWS_STS_REGIONAL_ENDPOINTS
-          value: "regional"
-        - name: AWS_MAX_ATTEMPTS
-          value: "2"
       resources:
         requests: {cpu: 50m, memory: 128Mi}
         limits:   {cpu: 500m, memory: 512Mi}
@@ -75,12 +61,12 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: bedrock-test-script
-  namespace: bedrock-test
+  namespace: agentic
 data:
   test.sh: |
     #!/usr/bin/env bash
-    REGION_="${AWS_REGION}"
-    MODEL_="${BEDROCK_MODEL_ID}"
+    REGION_="${ap-southeast-1}"
+    MODEL_="${openai.gpt-5.6-luna}"
     PASS=0; WARN=0; FAIL=0
     AWSCLI=(aws --no-cli-pager --cli-connect-timeout 5 --cli-read-timeout 30 --region "$REGION_")
 
